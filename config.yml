@@ -1,0 +1,10 @@
+filters:
+  -
+    pcap: 'port 80 or port 8080'
+    stats:
+      - cum(len)
+      - count(port=8080)
+  -
+    pcap: 'port 22'
+    stats:
+      - cum(len)
