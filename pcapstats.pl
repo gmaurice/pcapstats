@@ -1,26 +1,22 @@
 #!/usr/bin/env perl
+use strict;
 use Net::Pcap;
 use NetPacket::Ethernet;
 use NetPacket::IP;
 use NetPacket::TCP;
-#use Parallel::ForkManager;
 use IPC::ShareLite qw( :lock );;
-#use IPC::Shareable (':lock');
 use Getopt::Long;
 use Try::Tiny;
 use YAML qw/Dump DumpFile Load LoadFile/;
-use strict;
 use POSIX ":sys_wait_h";
-            use Storable qw( freeze thaw );
-
+use Storable qw( freeze thaw );
+use IO::Interface::Simple;
 $|++;
 
 my $DEBUG = 1 if $ENV{PCAPSTATS_DEBUG} == 1;
 
-### Shared mem
-
 my $stats = {};
-my ($err, $conf ) ;
+my ($err, $conf );
 
 GetOptions(
     "config=s"      => \my $config_file,
@@ -35,9 +31,6 @@ GetOptions(
 
 if ( defined $config_file and -f $config_file ){
     $conf = LoadFile( $config_file );
-    while ( my ( $k, $v ) = each( %$conf ) ){
-        eval "\$$k = $v;";
-    }
     my $i = 1;
     while ( my $f = shift @{ $conf->{ filters } } ){
         push( @pcap_filters, $f->{ pcap } );
@@ -71,9 +64,8 @@ $interval ||= 60;
 
 
 ### Get my ip
-
-$my_ip ||=  `host \`hostname\`| grep 'has address' | awk '{ print \$4 }'`;
-chomp( $my_ip );
+my $if = IO::Interface::Simple->new( $dev );
+$my_ip ||= $if->address;
 print "My ip: $my_ip\n";
 
 ### Shared memory
@@ -124,9 +116,11 @@ sub alrm{
 local $SIG{ALRM} = \&alrm;
 
 sub sig{
-    warn Dump @_ if $DEBUG;
+    warn Dump @_;
 }
 local $SIG{CHLD} = \&sig;
+
+$SIG{PIPE} = \&sig;
 
 sub sigint{
     for ( @children ){
@@ -307,6 +301,7 @@ while ( $forks-- ) {
     }
     else{
         warn "w forks $forks" if $DEBUG;
+        $0 = "$0 -d $dev -i $interval -f '$pcap_filters[$filter_number - 1]' (filter_number: $filter_number)";
         &child ( $filter_number );
         last;
     }
