@@ -1,30 +1,32 @@
 #!/usr/bin/env perl
 use strict;
-use Net::Pcap;
-use NetPacket::Ethernet;
-use NetPacket::IP;
-use NetPacket::TCP;
-use IPC::ShareLite qw( :lock );;
 use Getopt::Long;
 use Try::Tiny;
 use YAML qw/Dump DumpFile Load LoadFile/;
 use POSIX ":sys_wait_h";
 use Storable qw( freeze thaw );
 use IO::Interface::Simple;
-$|++;
+use Net::Pcap;
+use NetPacket::Ethernet;
+use NetPacket::IP;
+use NetPacket::TCP;
+use IPC::ShareLite qw( :lock );;
+
+$| = 1; # need autoflush in order to make tail working
 
 my $DEBUG = 1 if $ENV{PCAPSTATS_DEBUG} == 1;
 
 my $stats = {};
-my ($err, $conf );
+my ($err, $dev, $config_file, $conf, $interval, @pcap_filters, @wanted_stats, $my_ip, @children, @shares );
+
 
 GetOptions(
-    "config=s"      => \my $config_file,
-    "device=s"      => \my $dev,
-    "interval=i"    => \my $interval,
-    "filter=s"      => \my @pcap_filters,
-    "stats=s"       => \my @wanted_stats,
-    "my_ip=s"       => \my $my_ip,
+    "config=s"      => \$config_file,
+    "device=s"      => \$dev,
+    "interval=i"    => \$interval,
+    "filter=s"      => \@pcap_filters,
+    "stats=s"       => \@wanted_stats,
+    "my_ip=s"       => \$my_ip,
     "help"          => \my $help
 );
 
@@ -62,52 +64,15 @@ sub usage{
 
 $interval ||= 60;
 
+print "interval can't be equal to zero.\n" unless $interval;
+exit 1 unless $interval;
 
 ### Get my ip
 my $if = IO::Interface::Simple->new( $dev );
 $my_ip ||= $if->address;
 print "My ip: $my_ip\n";
 
-### Shared memory
-my $share = IPC::ShareLite->new(
-        -key     => "lite",
-        -mode    => 0600,
-        -create  => 'yes',
-        -destroy => 'yes'
-) or die $!;
-
-$share->store( freeze( $stats ) );
-
-my @children;
-
-print "Capturing traffic on $dev, print pcap stats every $interval secs.\n";
-
-sub time_elapsed {
-    print "\n$$ " . Dump ($stats) if $DEBUG;
-    my $time = time ;
-
-    $share->lock( LOCK_EX );
-    $stats = thaw( $share->fetch );
-
-    for ( my $f_num = 1; $f_num <= @children ; $f_num++ ){
-        my @out = ( $time );
-        for my $ws ( grep{ /^$f_num\./ } @wanted_stats ){
-
-            for ( split(',', $ws ) ){
-                /([a-zA-Z]+)\(([0-9a-zA-Z_ =.-]+)\)/;
-
-                push ( @out, $stats->{ $f_num }->{ rx }->{ $2 }->{ $1 } );
-                push ( @out, $stats->{ $f_num }->{ tx }->{ $2 }->{ $1 } );
-
-            }
-
-        }
-        print $f_num , "," , join(',', @out ) , "\n";
-        undef @out;
-    }
-    $share->store( freeze( $stats ) );
-    $share->unlock;
-}
+print "Capturing packets on $dev, print pcap stats every $interval secs.\n";
 
 sub alrm{
     &time_elapsed;
@@ -131,24 +96,73 @@ sub sigint{
     alarm 0;
 }
 
+sub time_elapsed {
+    print "\n$$ " . Dump ($stats) if $DEBUG;
+
+    my $time = time ;
+    # $share->lock( LOCK_EX );
+
+    for ( my $f_num = 1; $f_num <= @children ; $f_num++ ){
+        while ( 1 ){
+            $stats = thaw( $shares[ $f_num ]->fetch );
+            last if $stats;
+        }
+        my @out = ( $time );
+        for my $ws ( grep{ /^$f_num\./ } @wanted_stats ){
+
+            for ( split(',', $ws ) ){
+                /([a-zA-Z]+)\(?([0-9a-zA-Z_ =.-]+)?\)?/;
+                if ( $1 eq 'bw' or $1 eq 'throughput' ){
+                    push( @out, $stats->{ $f_num }->{ rx }->{ bw }->{ count } == 0 ?
+                        0
+                        :
+                        ($stats->{ $f_num }->{ rx }->{ bw }->{ bytes } / $stats->{ $f_num }->{ rx }->{ bw }->{ count }) / $interval );
+                    push( @out, $stats->{ $f_num }->{ tx }->{ bw }->{ count } == 0 ? 
+                        0
+                        :
+                        ($stats->{ $f_num }->{ tx }->{ bw }->{ bytes } / $stats->{ $f_num }->{ tx }->{ bw }->{ count }) / $interval );
+                }
+                else{
+                    push ( @out, $stats->{ $f_num }->{ rx }->{ $2 }->{ $1 } );
+                    push ( @out, $stats->{ $f_num }->{ tx }->{ $2 }->{ $1 } );
+                }
+            }
+        }
+        print $f_num , "," , join(',', @out ) , "\n";
+        undef @out;
+    }
+    for ( @children ){
+        kill 1, $_;
+    }
+    # $share->unlock;
+}
+
 sub master {
     my ( $pid, $forks ) = @_;
     push ( @children, $pid );
     warn "w $pid pushed" if $DEBUG;
     if ( $forks == 0 ){
-        warn "master $$ AV wait"if $DEBUG;
 
         local $SIG{INT} = \&sigint;
         print "CSV output headers:\n";
         for ( my $f_num = 1; $f_num <= @children ; $f_num++ ){
-            print "filter_number($f_num),timestamp,", join(',', ( map { ("$1.rx", "$1.tx" ) if /^$f_num\.(.+)/; } grep { /^$f_num\./; } @wanted_stats ) ) , "\n";
+            print "filter_number($f_num),timestamp,", join(',', ( 
+                map { 
+                    /^$f_num\.(.+)/;
+                    my @ret;
+                    for ( split(',', $1) ){ 
+                        push( @ret, ( "$_.rx", "$_.tx" ) );
+                    }
+                    @ret;
+                } grep { /^$f_num\./; } @wanted_stats ) ) , "\n";
         }
         alarm $interval;
         for ( @children ){
             waitpid -1, 0;
         }
         warn "master $$ ending"if $DEBUG;
-        undef $share;
+        undef $_ for @shares;
+        undef @shares;
     }
 }
 
@@ -156,28 +170,44 @@ sub child {
     my $f_num = shift;
     my ($address, $netmask, $object, $time_elapsed );
 
-    use POSIX qw(SIGTERM);
+    use POSIX qw(SIGTERM SIGHUP);
 
     POSIX::sigaction('SIGTERM', POSIX::SigAction->new(sub { print "$$ is exiting TERM...\n"; Net::Pcap::breakloop($object); sleep 1; Net::Pcap::close($object); #IPC::Shareable->clean_up; 
         exit 0; }))
                   || die "Error setting SIGTERM handler: $!\n";
+    POSIX::sigaction('SIGHUP', POSIX::SigAction->new(sub { $time_elapsed = 1; }))
+                  || die "Error setting SIGHUP handler: $!\n";
 
     if (Net::Pcap::lookupnet($dev, \$address, \$netmask, \$err)) {
         die 'Unable to look up device information for ', $dev, ' - ', $err;
     }
     try{
-        $share->lock( LOCK_EX );
-        $stats = thaw( $share->fetch );
+        #$share->lock( LOCK_EX );
+        $stats = thaw( $shares[ $f_num ]->fetch );
         for my $ws ( grep { /^$f_num\./ } @wanted_stats ){
             for ( split(',', $ws ) ){
-                /([a-zA-Z]+)\(([0-9a-zA-Z_ =.-]+)\)/;
-                $stats->{ $f_num }->{ rx }->{ $2 }->{ $1 } = 0;
-                $stats->{ $f_num }->{ tx }->{ $2 }->{ $1 } = 0;
+                /([a-zA-Z]+)\(?([0-9a-zA-Z_ =.-]+)?\)?/;
+                if ( $1 eq 'bw' or $1 eq 'throughput' ){
+                    $stats->{ $f_num }->{ rx }->{ bw }->{ bytes } = 0;
+                    $stats->{ $f_num }->{ tx }->{ bw }->{ bytes } = 0; 
+                    $stats->{ $f_num }->{ rx }->{ bw }->{ count } = 0;
+                    $stats->{ $f_num }->{ tx }->{ bw }->{ count } = 0; 
+                }
+                else{
+                    $stats->{ $f_num }->{ rx }->{ $2 }->{ $1 } = 0;
+                    $stats->{ $f_num }->{ tx }->{ $2 }->{ $1 } = 0;                    
+                }
             }
+            # if ( $ws =~ /\.(bw|throughput)/ ){
+            #     $stats->{ $f_num }->{ rx }->{ bw }->{ bytes } = 0;
+            #     $stats->{ $f_num }->{ tx }->{ bw }->{ bytes } = 0;
+            #     $stats->{ $f_num }->{ rx }->{ bw }->{ count } = 0;
+            #     $stats->{ $f_num }->{ tx }->{ bw }->{ count } = 0;
+            # }
         }
 
-        $share->store( freeze( $stats ) );
-        $share->unlock;
+        $shares[ $f_num ]->store( freeze( $stats ) );
+        #$share->unlock;
 
         #   Create packet capture object on device
         $object = Net::Pcap::open_live($dev, 1500, 0, 0, \$err);
@@ -218,11 +248,22 @@ sub child {
         my $ip = NetPacket::IP->decode($ether_data);
         
         my $updated = 0;
-        while ( ! $updated ){
+        # while ( ! $updated ){
 
-            if ( $share->lock( LOCK_EX ) ){
+            #if ( $share->lock( LOCK_EX ) ){
 
-                $stats = thaw( $share->fetch( ));
+                # $stats = thaw( $shares[ $f_num ]->fetch( ));
+                if ( $time_elapsed ){
+                    if ( exists $stats->{ $f_num }->{ rx }->{ bw } ){
+                        $stats->{ $f_num }->{ rx }->{ bw }->{ bytes } = 0;
+                        $stats->{ $f_num }->{ rx }->{ bw }->{ count } = 0;
+                    }
+                    if ( exists $stats->{ $f_num }->{ tx }->{ bw } ){
+                        $stats->{ $f_num }->{ tx }->{ bw }->{ bytes } = 0;
+                        $stats->{ $f_num }->{ tx }->{ bw }->{ count } = 0;
+                    }
+                    $time_elapsed = 0;
+                }
 
                 $stats->{ $f_num }->{ last_update } = time;
                 if ( $ip->{ dest_ip } == $my_ip ){
@@ -232,12 +273,12 @@ sub child {
                     &stat_function( $stats->{ $f_num }->{ tx }, $header, $packet, $ether_data, $ip );
                 }
 
-                $share->store( freeze( $stats ) );
-                $share->unlock;
+                $shares[ $f_num ]->store( freeze( $stats ) );
+                # $share->unlock;
 
                 $updated = 1;
-            }
-        }
+            # }
+        # }
     }
 
     sub stat_function{
@@ -245,12 +286,18 @@ sub child {
 
         warn "$$ $f_num ", Dump $stats if $DEBUG;
         for my $field ( keys %{ $stats } ){
+            if ( $field eq 'bw' ){
+                $stats->{ $field }->{ bytes } += $header->{ len };
+                $stats->{ $field }->{ count }++;
+                next;
+            }
             for my $function ( keys %{ $stats->{ $field } } ){
                 if ( $function eq 'cum' ){
                     if ( $field eq 'len' ) {
                         $stats->{ $field }->{ $function } += $header->{ len };
                     }
-                }elsif( $function eq 'count'){
+                }
+                elsif( $function eq 'count'){
                     $field =~ /([a-zA-Z ]+)\s*=\s*(.+)/;
                     my $f_name = $1;
                     my $f_value = $2;
@@ -294,6 +341,17 @@ warn "forks = $forks" if $DEBUG;
 while ( $forks-- ) {
     $filter_number++;
     # Forks and returns the pid for the child:
+
+    ### Prepare shared memory segments for child'stats
+    $shares[ $filter_number ] = IPC::ShareLite->new(
+        -key     => "pf$filter_number",
+        -mode    => 0600,
+        -create  => 'yes',
+        -destroy => 'yes'
+    ) or die $!;
+
+    $shares[ $filter_number ]->store( freeze( $stats ) );
+
     my $pid = fork();
     if ( $pid != 0 ){
         warn "m forks $forks"if $DEBUG;
