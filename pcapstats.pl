@@ -75,13 +75,15 @@ print "My ip: $my_ip\n";
 print "Capturing packets on $dev, print pcap stats every $interval secs.\n";
 
 sub alrm{
+    # here we print the current statistics
     &time_elapsed;
+    # we will schedule the next print of statistics 
     alarm $interval;
 };
 local $SIG{ALRM} = \&alrm;
 
 sub sig{
-    warn Dump @_;
+    #do nothing for now
 }
 local $SIG{CHLD} = \&sig;
 
@@ -132,6 +134,7 @@ sub time_elapsed {
         undef @out;
     }
     for ( @children ){
+        # we send signal to all children to make them reset the statistics that need to be set to 0 before gathering statisctis for the next interval
         kill 1, $_;
     }
     # $share->unlock;
@@ -172,11 +175,14 @@ sub child {
 
     use POSIX qw(SIGTERM SIGHUP);
 
-    POSIX::sigaction('SIGTERM', POSIX::SigAction->new(sub { print "$$ is exiting TERM...\n"; Net::Pcap::breakloop($object); sleep 1; Net::Pcap::close($object); #IPC::Shareable->clean_up; 
-        exit 0; }))
-                  || die "Error setting SIGTERM handler: $!\n";
-    POSIX::sigaction('SIGHUP', POSIX::SigAction->new(sub { $time_elapsed = 1; }))
-                  || die "Error setting SIGHUP handler: $!\n";
+    POSIX::sigaction('SIGTERM', POSIX::SigAction->new(sub { 
+        print "$$ is exiting TERM...\n"; Net::Pcap::breakloop($object); sleep 1; Net::Pcap::close($object); #IPC::Shareable->clean_up; 
+        exit 0;
+    })) || die "Error setting SIGTERM handler: $!\n";
+    POSIX::sigaction('SIGHUP', POSIX::SigAction->new(sub { 
+        # it"s time to reset if you need
+        $time_elapsed = 1;
+    })) || die "Error setting SIGHUP handler: $!\n";
 
     if (Net::Pcap::lookupnet($dev, \$address, \$netmask, \$err)) {
         die 'Unable to look up device information for ', $dev, ' - ', $err;
