@@ -154,7 +154,7 @@ sub master {
                     /^$f_num\.(.+)/;
                     my @ret;
                     for ( split(',', $1) ){ 
-                        push( @ret, ( "$_.rx", "$_.tx" ) );
+                        push( @ret, ( "rx.$_", "tx.$_" ) );
                     }
                     @ret;
                 } grep { /^$f_num\./; } @wanted_stats ) ) , "\n";
