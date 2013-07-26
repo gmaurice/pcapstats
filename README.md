@@ -5,4 +5,4 @@ Monitor network packets on a specific device. The gathered statistics are printe
  
  - Supports CSV output format
  - Supports several filters and several statistics
- - Printed statistics are printed after "interval" seconds elapsed
+ - Statistics are printed every "interval" seconds
