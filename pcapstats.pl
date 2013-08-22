@@ -173,7 +173,11 @@ sub child {
     my $f_num = shift;
     my ($address, $netmask, $object, $time_elapsed );
 
-    use POSIX qw(SIGTERM SIGHUP);
+    use POSIX qw(SIGTERM SIGHUP SIGINT);
+
+    # only master will do something on sigint
+    POSIX::sigaction('SIGINT', POSIX::SigAction->new(sub {
+    } )) || die "Error setting SIGINT handler: $!\n";
 
     POSIX::sigaction('SIGTERM', POSIX::SigAction->new(sub { 
         print "$$ is exiting TERM...\n"; Net::Pcap::breakloop($object); sleep 1; Net::Pcap::close($object); #IPC::Shareable->clean_up; 
